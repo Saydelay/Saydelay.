@@ -553,6 +553,11 @@
         }
 
         /* ---------- Gemeinsam schauen ---------- */
+        .p-guest { display: none; }
+        #player.guest .p-guest { display: grid; }
+        #player.guest #p-next, #player.guest #p-party { display: none; }
+        #player.guest.idle .p-top { opacity: 1; pointer-events: auto; }
+        #p-mute .x { display: none; } #p-mute.off .x { display: block; } #p-mute.off .on { display: none; }
         .p-tap { position: absolute; z-index: 4; left: 50%; top: 50%; transform: translate(-50%, -50%); display: none; align-items: center; gap: 10px;
             padding: 18px 26px; border-radius: 18px; border: 0; color: #fff; font: inherit; font-weight: 800; font-size: 17px; cursor: pointer;
             background: linear-gradient(135deg, var(--purple-2), var(--purple)); box-shadow: 0 14px 50px rgba(0,0,0,.6), 0 0 40px var(--glow); }
@@ -718,6 +723,8 @@
     <div class="p-top">
         <button class="p-btn" onclick="closePlayer()">◀ Zurück</button>
         <div class="p-title" id="p-title"></div>
+        <button class="p-btn p-icon p-guest" id="p-mute" onclick="partyMute()" title="Ton an/aus"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9z"/><path class="on" d="M16.5 8.5a5 5 0 0 1 0 7"/><path class="x" d="M17 9l5 6M22 9l-5 6"/></svg></button>
+        <button class="p-btn p-icon p-guest" id="p-fs" onclick="partyFullscreen()" title="Vollbild"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
         <button class="party-pill" id="party-pill" onclick="partyDialog()"></button>
         <button class="p-btn p-icon" id="p-party" onclick="partyDialog()" title="Gemeinsam schauen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.7-3.6 3.4-5.5 6.5-5.5s5.8 1.9 6.5 5.5M16 4.8a3.5 3.5 0 0 1 0 6.4M18 14.8c2 .7 3.2 2.5 3.6 5.2"/></svg></button>
         <button class="p-btn" id="p-next">Nächste Folge ▶</button>
@@ -1549,7 +1556,7 @@ function closePlayer(fromHistory) {
 const party = {
     code: null, st: null, ver: -1, offset: 0, cid: Math.random().toString(36).slice(2, 10),
     expect: { seek: null, play: 0, pause: 0 }, polling: false, driftTimer: null, startTimer: null, lastLocal: 0,
-    waitSince: 0, lastFix: 0, fixes: [], seekLag: 0.8, seekStart: 0, glide: 0, glidePause: false, lastHb: 0, noteAt: 0, localPaused: false, rebuf: 0, stallLog: [], slowTold: false,
+    waitSince: 0, lastFix: 0, fixes: [], seekLag: 0.25, seekStart: 0, glide: 0, glidePause: false, lastHb: 0, noteAt: 0, localPaused: false, rebuf: 0, stallLog: [], slowTold: false, resync: false,
 };
 /* Prinzip: EIN Gastgeber gibt den Takt vor. Er wird nie gebremst, verschoben oder angehalten.
    Alle anderen folgen ihm: gemeinsamer Start auf die Millisekunde geplant, kleine Abweichungen
@@ -1606,9 +1613,8 @@ function partyTap() {
     $('p-tap').classList.remove('show');
     party.localPaused = false;
     if (!party.code || !party.st) return;
-    const exp = partyExpected();
-    if (Math.abs(video.currentTime - exp) > 0.3) { markExpected('seek', exp); video.currentTime = exp; }
     if (partyRuns()) { markExpected('play'); video.play().catch(() => {}); }
+    partyResync();
 }
 // Punktgenau zum vereinbarten Zeitpunkt starten
 function partySchedule() {
@@ -1619,6 +1625,29 @@ function partySchedule() {
         if (party.code && partyRuns() && video.paused && !party.localPaused && !party.rebuf) partyPlay();
     // loslaufen genau dann, wenn der Gastgeber an der Stelle dieses Geräts vorbeikommt (ohne vorher zu springen)
     }, Math.max(0, party.st.at - serverNow() - (party.st.pos - video.currentTime) * 1000));
+}
+function partyControls() {
+    const guest = !!(party.code && party.st && !isHost());
+    video.controls = !guest || IS_IPHONE;   // iPhone nutzt immer Apples Vollbild-Player
+    $('player').classList.toggle('guest', guest);
+    if (!guest) $('p-tap').classList.remove('show');
+}
+function partyFullscreen() {
+    const el = $('player'), d = document;
+    if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+}
+function partyMute() { video.muted = !video.muted; $('p-mute').classList.toggle('off', video.muted); }
+// Gast hat (irgendwie) angehalten oder gespult -> sofort wieder an die Stelle des Gastgebers
+function partyResync() {
+    party.resync = false;
+    if (!party.code || !party.st || isHost() || !playing || playing.id !== party.st.file) return;
+    const exp = partyExpected() + (partyRuns() ? Math.min(1.5, party.seekLag) : 0);
+    if (Math.abs(video.currentTime - exp) > 0.4) { party.seekStart = Date.now(); markExpected('seek', exp); video.currentTime = exp; }
+    party.glide = 0; if (video.playbackRate !== 1) video.playbackRate = 1;
+    party.tight = Date.now();   // direkt danach einmal genau nachstellen
 }
 function guestNote() {
     if (Date.now() - party.noteAt < 4000) return;
@@ -1667,29 +1696,35 @@ video.addEventListener('play', () => {
     if (Date.now() - party.expect.play < 1500) { party.expect.play = 0; return; }
     if (isHost()) return partySend();
     if (!partyRuns()) { markExpected('pause'); video.pause(); guestNote(); }   // Party ist pausiert – Gast kann nicht starten
+    else { party.localPaused = false; partyResync(); }                          // Gast steigt wieder ein -> direkt zur gemeinsamen Stelle
 });
 video.addEventListener('pause', () => {
     if (!party.code || video.ended) return;
     if (Date.now() - party.expect.pause < 1500) { party.expect.pause = 0; return; }
     if (isHost()) return partySend();
     if (!partyRuns()) return;
+    party.resync = true;
     guestNote();
     if (IS_IPHONE) { party.localPaused = true; $('p-tap').classList.add('show'); }   // iPhone: Vollbild verlassen – per Tipp wieder einsteigen
     else setTimeout(() => { if (party.code && partyRuns() && video.paused) partyPlay(); }, 60);
 });
 video.addEventListener('seeked', () => {
     if (!party.code) return;
+    if (party.seekStart) {   // gemessen: so lange braucht dieses Gerät für einen Sprung
+        const lag = (Date.now() - party.seekStart) / 1000;
+        party.seekLag = Math.max(0.05, Math.min(4, party.seekLag * 0.4 + lag * 0.6));
+        party.seekStart = 0;
+    }
     if (party.expect.seek != null && Math.abs(video.currentTime - party.expect.seek) < 1.5) { party.expect.seek = null; return; }
     if (isHost()) return partySend();
-    const exp = partyExpected();   // Gast hat gespult -> zurück zur gemeinsamen Stelle
-    if (Math.abs(video.currentTime - exp) > 0.5) { markExpected('seek', exp); video.currentTime = exp; guestNote(); }
+    guestNote(); partyResync();   // Gast hat gespult -> zurück zur gemeinsamen Stelle
 });
 
 // Stand vom Pi anwenden (nur Gäste – der Gastgeber ist selbst die Quelle)
 function partyApply(st) {
     const prev = party.st;
     party.st = st; party.ver = st.ver;
-    renderPartyBar();
+    renderPartyBar(); partyControls();
     if (prev && prev.host !== st.host && isHost(st)) toast('Du bist jetzt Gastgeber der Party');
     if (!$('player').classList.contains('open') && !party.joining) return;
     if (isHost(st)) return;
@@ -1730,7 +1765,7 @@ function partyDrift() {
     if (isHost()) {
         if (video.playbackRate !== 1) video.playbackRate = 1;
         if (partyRuns() && !video.paused && !video.seeking && video.readyState >= 3 && serverNow() > party.st.at + 500
-            && ad > 0.25 && now - party.lastLocal > 2500 && now - party.lastHb > 4000) { party.lastHb = now; partySend({ hb: true }); }
+            && ad > 0.12 && now - party.lastLocal > 2500 && now - party.lastHb > 4000) { party.lastHb = now; partySend({ hb: true }); }
         if (sync) sync.textContent = partyRuns() ? 'du gibst den Takt vor' : 'pausiert';
         return;
     }
@@ -1761,6 +1796,7 @@ function partyDrift() {
     if (video.seeking || stalled) { partyInfo('lädt …', 'warn', diff); return; }   // beim Laden nichts anfassen
     if (partyRuns()) {
         if (video.paused) partyPlay();
+        if (party.resync && !video.paused) { partyResync(); return; }
         party.fixes = party.fixes.filter(t => now - t < 120000);
         if (ad > 20 && now - party.lastFix > 10000 * Math.pow(2, party.fixes.length)) {
             // Notfall: mehr als 20 s auseinander (Leitung viel zu langsam) – einmal zur gemeinsamen Stelle
@@ -1770,8 +1806,8 @@ function partyDrift() {
         } else {
             // Bis 0,5 s Abstand wird nichts verändert. Darüber EIN festes Tempo (±5 %), bis es wieder passt.
             const dir = Math.sign(diff);
-            if (!party.glide && ad > 0.5) party.glide = dir;
-            if (party.glide && (ad < 0.08 || dir !== party.glide)) party.glide = 0;
+            if (!party.glide && ad > (now - (party.tight || 0) < 20000 ? 0.12 : 0.5)) party.glide = dir;
+            if (party.glide && (ad < 0.04 || dir !== party.glide)) party.glide = 0;
             // Schneller laufen nur mit genug Vorrat – sonst würde das Aufholen selbst Hänger auslösen
             if (party.glide > 0 && bufferedAhead() < 6) party.glidePause = true;
             if (party.glidePause && (bufferedAhead() >= 12 || party.glide <= 0)) party.glidePause = false;
@@ -1860,6 +1896,7 @@ async function partyCreateFor(id) {
     } catch (e) { toast('Party konnte nicht erstellt werden – ist der Pi aktuell? (update.sh)'); }
 }
 function partyBegin() {
+    partyControls();
     video.preload = 'auto';
     party.fixes = []; party.lastFix = 0; party.glide = 0; party.localPaused = false; party.rebuf = 0; party.stallLog = []; party.slowTold = false;
     clearInterval(party.driftTimer);
@@ -1873,6 +1910,7 @@ function partyLeave(silent) {
     clearInterval(party.driftTimer);
     video.playbackRate = 1;
     partyCall('leave', { code }).catch(() => {});
+    partyControls();
     video.preload = 'metadata'; clearTimeout(party.startTimer); party.startTimer = null; party.glide = 0; party.glidePause = false; party.localPaused = false; party.rebuf = 0; party.stallLog = []; party.slowTold = false; $('p-tap').classList.remove('show');
     renderPartyBar();
     if (!silent) toast('Party verlassen');
@@ -2010,6 +2048,7 @@ function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add
 /* ---------- Tastatur ---------- */
 document.addEventListener('keydown', e => {
     if ($('player').classList.contains('open')) {
+        if (party.code && !isHost() && [' ', 'ArrowRight', 'ArrowLeft'].includes(e.key)) { e.preventDefault(); guestNote(); return; }
         if (e.key === 'Escape') closePlayer();
         else if (e.key === ' ' && document.activeElement !== video) { e.preventDefault(); video.paused ? video.play() : video.pause(); }
         else if (e.key === 'ArrowRight') video.currentTime += 10;
