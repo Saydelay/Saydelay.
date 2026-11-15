@@ -1669,8 +1669,11 @@ function partyApply(st) {
         if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
     } else {
         clearTimeout(party.startTimer); party.startTimer = null;
-        if (!video.paused) { markExpected('pause'); video.pause(); }
-        if (off > 0.15) { markExpected('seek', exp); video.currentTime = exp; }   // im Standbild angleichen – fällt nicht auf
+        const catching = st.held && st.playing && exp - video.currentTime > 0.15 && exp - video.currentTime < 60;   // holt noch auf
+        if (!catching) {
+            if (!video.paused) { markExpected('pause'); video.pause(); }
+            if (off > 0.15) { markExpected('seek', exp); video.currentTime = exp; }   // im Standbild angleichen – fällt nicht auf
+        }
     }
     if (st.held && (!prev || !prev.held)) {
         const others = (st.waitingFor || []).filter(n => !party.holding || n !== partyName());
@@ -1696,47 +1699,59 @@ function partyDrift() {
         if (video.playbackRate !== 1) video.playbackRate = 1;
         return;
     }
-    // 1) Dieses Gerät kommt länger nicht hinterher -> alle kurz warten lassen
+    // 1) Dieses Gerät hängt länger fest -> alle warten lassen (kurze Hänger holt es später selbst leise auf)
     const stalled = video.readyState < 3 || (party.waitSince && now - party.waitSince > 300);
     if (stalled && partyRuns()) { if (!party.stallSince) party.stallSince = now; } else party.stallSince = 0;
-    if (party.stallSince && now - party.stallSince > 1200 && !party.holding && !video.seeking && now - party.lastLocal > 1500) {
-        party.holding = true;
+    party.holdTimes = (party.holdTimes || []).filter(t => now - t < 180000);
+    const behind = partyExpected() - video.currentTime;
+    if (((party.stallSince && now - party.stallSince > 3000) || (partyRuns() && behind > 4 && behind < 60)) && !party.holding && !video.seeking && now - party.lastLocal > 1500) {
+        party.holding = true; party.holdTimes.push(now);
         partyCall('hold', { code: party.code, on: true }).then(j => { if (j.ver > party.ver) partyApply(j); }).catch(() => {});
     }
-    if (party.holding && (ahead >= 4 || (video.readyState === 4 && ahead >= 2) || video.duration - video.currentTime < 4)) {
+    // Lieber einmal länger laden als oft kurz: nach jeder Wartepause wird mehr Vorrat verlangt
+    const need = [6, 12, 20][Math.min(2, Math.max(0, party.holdTimes.length - 1))];
+    const caught = !party.st.held || behind < 0.3;
+    if (party.holding && caught && (ahead >= need || video.duration - video.currentTime < need + 1 || (now - party.holdTimes[party.holdTimes.length - 1] > 40000 && ahead >= 3))) {
         party.holding = false;
         partyCall('hold', { code: party.code, on: false }).then(j => { if (j.ver > party.ver) partyApply(j); }).catch(() => {});
     }
     if (sync) sync.textContent = party.st.held ? `wartet auf ${(party.st.waitingFor || []).join(', ') || 'Gerät'} …` : '…';
-    // 2) Während geladen oder gesprungen wird: nichts verstellen
-    if (video.seeking || stalled) { if (video.playbackRate !== 1) video.playbackRate = 1; return; }
+    // 2) Während geladen oder gesprungen wird: nichts anfassen (auch das Tempo nicht)
+    if (video.seeking || stalled) return;
     if (now - party.lastLocal < 1500) return;
     const exp = partyExpected(), diff = exp - video.currentTime, ad = Math.abs(diff);
     if (partyRuns()) {
         if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
-        party.fixes = party.fixes.filter(t => now - t < 60000);
-        if (ad > 8 && now - party.lastFix > 5000 * Math.pow(2, party.fixes.length)) {
+        party.fixes = party.fixes.filter(t => now - t < 120000);
+        if (ad > 12 && now - party.lastFix > 8000 * Math.pow(2, party.fixes.length)) {
             // Notfall (völlig auseinander): einmal springen
             const target = exp + (diff > 0 ? party.seekLag : 0);
             party.lastFix = now; party.fixes.push(now); party.seekStart = now;
-            markExpected('seek', target); video.currentTime = target; video.playbackRate = 1; party.gliding = false;
+            markExpected('seek', target); video.currentTime = target; video.playbackRate = 1; party.glide = 0;
         } else {
-            // Normalfall: KEIN Sprung. Das Video läuft unmerklich schneller/langsamer, bis es wieder passt.
-            if (!party.gliding && ad > 0.04) party.gliding = true;      // erst ab 0,04 s eingreifen …
-            if (party.gliding && ad < 0.012) party.gliding = false;     // … und bis fast 0 ausgleichen
-            let rate = 1;
-            if (party.gliding) {
-                const k = Math.min(ad > 2 ? 0.15 : 0.10, Math.max(0.01, ad * 0.4));   // meist 1–8 %, höchstens 15 %
-                rate = Math.round((1 + Math.sign(diff) * k) * 100) / 100;
-            }
-            if (video.playbackRate !== rate) video.playbackRate = rate;
+            // Ruhe vor Genauigkeit: Bis 0,35 s Abstand wird gar nichts verändert.
+            // Darüber läuft das Video mit EINEM festen Tempo (±5 %), bis es wieder passt – also nur zwei Tempowechsel.
+            const dir = Math.sign(diff);
+            if (!party.glide && ad > 0.35) party.glide = dir;
+            if (party.glide && (ad < 0.05 || dir !== party.glide)) party.glide = 0;
+            // Schneller laufen nur mit genug Vorrat – sonst würde das Aufholen selbst Hänger auslösen
+            if (party.glide > 0 && ahead < 5) party.glidePause = true;
+            if (party.glidePause && (ahead >= 9 || !party.glide || party.glide < 0)) party.glidePause = false;
+            const rate = !party.glide || party.glidePause ? 1 : party.glide > 0 ? (ad > 2 ? 1.08 : 1.05) : (ad > 2 ? 0.92 : 0.95);
+            if (video.playbackRate !== rate) { video.playbackRate = rate; party.rateChanges = (party.rateChanges || 0) + 1; }
         }
     } else {
         if (video.playbackRate !== 1) video.playbackRate = 1;
-        if (!video.paused) { markExpected('pause'); video.pause(); }
-        if (ad > 0.15) { markExpected('seek', exp); video.currentTime = exp; }
+        party.glide = 0;
+        if (party.st.held && party.st.playing && diff > 0.15 && diff < 60) {
+            // Die Party wartet auf dieses Gerät: bis zur gemeinsamen Stelle weiterspielen, nichts überspringen
+            if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
+        } else {
+            if (!video.paused) { markExpected('pause'); video.pause(); }
+            if (ad > 0.15) { markExpected('seek', exp); video.currentTime = exp; }
+        }
     }
-    if (sync && !party.st.held) sync.textContent = partyRuns() ? (ad < 0.1 ? 'synchron' : `gleicht sanft aus (${diff > 0 ? '+' : ''}${diff.toFixed(1)} s)`) : 'pausiert';
+    if (sync && !party.st.held) sync.textContent = partyRuns() ? (ad < 0.35 ? 'synchron' : `holt leise auf (${diff > 0 ? '+' : ''}${diff.toFixed(1)} s)`) : 'pausiert';
 }
 
 // Auf Änderungen warten (der Pi antwortet, sobald sich etwas tut)
@@ -1795,7 +1810,7 @@ function partyBegin() {
     video.preload = 'auto';
     party.holding = false; party.fixes = []; party.lastFix = 0;
     clearInterval(party.driftTimer);
-    party.driftTimer = setInterval(partyDrift, 250);
+    party.driftTimer = setInterval(partyDrift, 500);
     partyLoop(); renderPartyBar();
 }
 function partyLeave(silent) {
@@ -1805,7 +1820,7 @@ function partyLeave(silent) {
     clearInterval(party.driftTimer);
     video.playbackRate = 1;
     partyCall('leave', { code }).catch(() => {});
-    party.holding = false; video.preload = 'metadata'; clearTimeout(party.startTimer); party.startTimer = null; party.gliding = false;
+    party.holding = false; video.preload = 'metadata'; clearTimeout(party.startTimer); party.startTimer = null; party.glide = 0; party.glidePause = false; party.holdTimes = [];
     renderPartyBar();
     if (!silent) toast('Party verlassen');
 }
