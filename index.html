@@ -553,6 +553,11 @@
         }
 
         /* ---------- Gemeinsam schauen ---------- */
+        .p-tap { position: absolute; z-index: 4; left: 50%; top: 50%; transform: translate(-50%, -50%); display: none; align-items: center; gap: 10px;
+            padding: 18px 26px; border-radius: 18px; border: 0; color: #fff; font: inherit; font-weight: 800; font-size: 17px; cursor: pointer;
+            background: linear-gradient(135deg, var(--purple-2), var(--purple)); box-shadow: 0 14px 50px rgba(0,0,0,.6), 0 0 40px var(--glow); }
+        .p-tap.show { display: inline-flex; }
+        .p-tap svg { width: 22px; height: 22px; fill: #fff; }
         .p-icon { padding: 0; width: 42px; display: grid; place-items: center; }
         .p-icon svg { width: 20px; height: 20px; }
         .party-pill { display: none; align-items: center; gap: 7px; height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid rgba(62,224,143,.5);
@@ -714,6 +719,7 @@
         <button class="p-btn" id="p-next">Nächste Folge ▶</button>
     </div>
     <div class="p-msg" id="p-msg"></div>
+    <button class="p-tap" id="p-tap" onclick="partyTap()"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>Tippen zum Mitschauen</button>
     <button class="p-skip" id="p-skip" onclick="skipIntro()">Intro überspringen<svg viewBox="0 0 24 24"><path d="M5 5v14l9-7zM15 5h3v14h-3z"/></svg></button>
     <div class="p-spin" id="p-spin"></div>
 </div>
@@ -1482,7 +1488,7 @@ video.addEventListener('timeupdate', () => {
     if (Date.now() - lastSave > 4000) { lastSave = Date.now(); saveNow(); }
     // Intro überspringen
     const it = playing && introFor(playing.id), btn = $('p-skip');
-    const inIntro = it && video.currentTime >= it.start - 0.3 && video.currentTime < it.end - 1;
+    const inIntro = it && video.currentTime >= it.start - 0.3 && video.currentTime < it.end - 1 && !(party.code && !isHost());   // in der Party überspringt nur der Gastgeber
     if (inIntro && IS_IPHONE && !introSkipped[playing.id]) {
         // iPhone-Vollbild zeigt keine eigenen Knöpfe -> Intro automatisch überspringen
         introSkipped[playing.id] = true; skipIntro(); return;
@@ -1503,7 +1509,7 @@ video.addEventListener('ended', () => {
     if (!playing) return;
     progress[playing.id] = { ...(progress[playing.id] || {}), t: 0, done: true, ts: Date.now() }; saveProgress(playing.id);
     const nx = neighbour(playing.id);
-    if (nx && !IS_IPHONE) { toast('Nächste Folge startet…'); setTimeout(() => playing && playId(nx.id, true), 2500); }
+    if (nx && !IS_IPHONE && !(party.code && !isHost())) { toast('Nächste Folge startet…'); setTimeout(() => playing && playId(nx.id, true), 2500); }
 });
 
 // iPhone: "Fertig" im Apple-Player -> zurück zur Seite (außer eine Folge ist zu Ende, dann "Nächste Folge" anbieten)
@@ -1538,11 +1544,15 @@ function closePlayer(fromHistory) {
    ===================================================================== */
 const party = {
     code: null, st: null, ver: -1, offset: 0, cid: Math.random().toString(36).slice(2, 10),
-    expect: { seek: null, play: 0, pause: 0 }, polling: false, driftTimer: null, lastLocal: 0,
-    holding: false, waitSince: 0, lastFix: 0, fixes: [], seekLag: 0.8, seekStart: 0, waitToast: 0,
+    expect: { seek: null, play: 0, pause: 0 }, polling: false, driftTimer: null, startTimer: null, lastLocal: 0,
+    waitSince: 0, lastFix: 0, fixes: [], seekLag: 0.8, seekStart: 0, glide: 0, glidePause: false, lastHb: 0, noteAt: 0, localPaused: false,
 };
-// Läuft die Party gerade wirklich? (nicht, wenn jemand pausiert hat oder ein Gerät noch lädt)
-const partyRuns = (st = party.st) => !!(st && st.playing && !st.held);
+/* Prinzip: EIN Gastgeber gibt den Takt vor. Er wird nie gebremst, verschoben oder angehalten.
+   Alle anderen folgen ihm: gemeinsamer Start auf die Millisekunde geplant, kleine Abweichungen
+   werden mit leicht verändertem Tempo ausgeglichen – ohne Sprung, ohne Wartepause für alle. */
+const partyRuns = (st = party.st) => !!(st && st.playing);
+const isHost = (st = party.st) => !!(st && st.host === party.cid);
+const hostName = () => (party.st && party.st.hostName) || 'der Gastgeber';
 // Wie viele Sekunden hat dieses Gerät schon vorgeladen?
 function bufferedAhead() {
     const t = video.currentTime, b = video.buffered;
@@ -1559,7 +1569,7 @@ function partyExpected(st = party.st) {
 // Uhrzeit mit dem Pi abgleichen: mehrere Messungen, die schnellste zählt
 async function partyClock() {
     let best = null;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
         const t0 = Date.now();
         try {
             const r = await fetch(apiUrl('party/time'), { cache: 'no-store' });
@@ -1577,50 +1587,71 @@ async function partyCall(path, data) {
     return r.json();
 }
 
-// eigene Aktion an alle schicken
 const PARTY_LEAD = 700;   // ms Vorlauf für einen gemeinsamen Start
+function markExpected(kind, val) {
+    if (kind === 'seek') party.expect.seek = val;
+    else party.expect[kind] = Date.now();
+}
+// Abspielen – falls das Gerät es ohne Fingertipp verweigert (iPhone/iPad), einen großen Knopf zeigen
+function partyPlay() {
+    markExpected('play');
+    const pr = video.play();
+    if (pr && pr.catch) pr.catch(e => { if (e && e.name === 'NotAllowedError' && party.code) { party.localPaused = true; $('p-tap').classList.add('show'); } });
+}
+function partyTap() {
+    $('p-tap').classList.remove('show');
+    party.localPaused = false;
+    if (!party.code || !party.st) return;
+    const exp = partyExpected();
+    if (Math.abs(video.currentTime - exp) > 0.3) { markExpected('seek', exp); video.currentTime = exp; }
+    if (partyRuns()) { markExpected('play'); video.play().catch(() => {}); }
+}
 // Punktgenau zum vereinbarten Zeitpunkt starten
 function partySchedule() {
     clearTimeout(party.startTimer);
     if (!party.st) return;
     party.startTimer = setTimeout(() => {
         party.startTimer = null;
-        if (party.code && partyRuns() && video.paused) { markExpected('play'); video.play().catch(() => {}); }
+        if (party.code && partyRuns() && video.paused && !party.localPaused) partyPlay();
     }, Math.max(0, party.st.at - serverNow()));
 }
+function guestNote() {
+    if (Date.now() - party.noteAt < 4000) return;
+    party.noteAt = Date.now();
+    toast(`Nur ${hostName()} kann pausieren und spulen`);
+}
+
+// Nur der Gastgeber schickt Aktionen an alle
 function partySend(extra = {}) {
-    if (!party.code || (!playing && !extra.file)) return;
-    party.lastLocal = Date.now();
-    const intent = party.st && party.st.held ? party.st.playing : !video.paused;
+    if (!party.code || !isHost() || (!playing && !extra.file)) return;
+    const intent = extra.hb ? true : !video.paused;
     // Beim Abspielen einen gemeinsamen Startpunkt kurz in der Zukunft ansagen:
-    // "in 0,7 s sind wir an Stelle X" – dieses Gerät läuft einfach weiter, alle anderen starten punktgenau dazu.
-    const lead = intent && !extra.file ? PARTY_LEAD : 0;
+    // "in 0,7 s sind wir an Stelle X" – der Gastgeber läuft einfach weiter, alle anderen starten punktgenau dazu.
+    const lead = intent && !extra.file && !extra.hb ? PARTY_LEAD : 0;
+    if (!extra.hb) party.lastLocal = Date.now();
     const st = { code: party.code, playing: intent, pos: video.currentTime + lead / 1000, lead, ...extra };
-    // sofort lokal übernehmen, damit die Nachzieh-Logik nicht dagegen arbeitet
     party.st = { ...(party.st || {}), ...st, at: serverNow() + lead };
-    partyCall('update', st).then(j => { party.st = j; party.ver = j.ver; renderPartyBar(); }).catch(() => {});
+    partyCall('update', st).then(j => { if (j.ver >= party.ver) { party.st = j; party.ver = j.ver; renderPartyBar(); } }).catch(() => {});
 }
 
 // Hooks aus dem Player
 function partyOnLocalPlay(id, at, opts) {
     if (!party.code || opts.fromParty) return;
+    if (!isHost()) { partyLeave(true); toast('Du hast die Party verlassen'); return; }   // Gast wählt selbst etwas anderes
     const ref = byId[id]; const t = ref && ref.title;
     const title = t ? (t.type === 'series' ? `${t.name} · S${t.seasons[ref.si].number} ${t.seasons[ref.si].episodes[ref.ei].title}` : t.name) : '';
     party.lastLocal = Date.now();
     party.st = { ...(party.st || {}), file: id, title, playing: true, pos: at || 0, at: serverNow() };
     partyCall('update', { code: party.code, file: id, title, playing: true, pos: at || 0 }).then(j => { party.st = j; party.ver = j.ver; }).catch(() => {});
 }
-function partyOnLocalSeek() { if (party.code) partySend(); }
-function markExpected(kind, val) {
-    if (kind === 'seek') party.expect.seek = val;
-    else party.expect[kind] = Date.now();
-}
+function partyOnLocalSeek() { if (party.code && isHost()) partySend(); }
 
 // Laden beobachten
 video.addEventListener('waiting', () => { if (party.code && !party.waitSince) party.waitSince = Date.now(); });
 ['playing', 'canplay', 'canplaythrough'].forEach(ev => video.addEventListener(ev, () => {
     party.waitSince = 0;
-    if (party.seekStart && ev === 'playing') {   // gemessene Ladezeit nach einem Sprung merken
+    if (ev === 'playing') { $('p-tap').classList.remove('show'); party.localPaused = false; }
+    if (party.seekStart && ev === 'playing') {
         const lag = (Date.now() - party.seekStart) / 1000;
         party.seekLag = Math.max(0.3, Math.min(6, party.seekLag * 0.5 + lag * 0.5));
         party.seekStart = 0;
@@ -1628,35 +1659,42 @@ video.addEventListener('waiting', () => { if (party.code && !party.waitSince) pa
 }));
 video.addEventListener('play', () => {
     if (!party.code) return;
-    if (party.st && party.st.held && party.st.playing) { party.expect.play = 0; return; }   // Party wartet – Play nicht weiterreichen
     if (Date.now() - party.expect.play < 1500) { party.expect.play = 0; return; }
-    partySend();
+    if (isHost()) return partySend();
+    if (!partyRuns()) { markExpected('pause'); video.pause(); guestNote(); }   // Party ist pausiert – Gast kann nicht starten
 });
 video.addEventListener('pause', () => {
     if (!party.code || video.ended) return;
-    if (party.st && party.st.held) { party.expect.pause = 0; return; }
     if (Date.now() - party.expect.pause < 1500) { party.expect.pause = 0; return; }
-    partySend();
+    if (isHost()) return partySend();
+    if (!partyRuns()) return;
+    guestNote();
+    if (IS_IPHONE) { party.localPaused = true; $('p-tap').classList.add('show'); }   // iPhone: Vollbild verlassen – per Tipp wieder einsteigen
+    else setTimeout(() => { if (party.code && partyRuns() && video.paused) partyPlay(); }, 60);
 });
 video.addEventListener('seeked', () => {
     if (!party.code) return;
     if (party.expect.seek != null && Math.abs(video.currentTime - party.expect.seek) < 1.5) { party.expect.seek = null; return; }
-    partySend();
+    if (isHost()) return partySend();
+    const exp = partyExpected();   // Gast hat gespult -> zurück zur gemeinsamen Stelle
+    if (Math.abs(video.currentTime - exp) > 0.5) { markExpected('seek', exp); video.currentTime = exp; guestNote(); }
 });
 
-// Stand vom Pi anwenden
+// Stand vom Pi anwenden (nur Gäste – der Gastgeber ist selbst die Quelle)
 function partyApply(st) {
     const prev = party.st;
     party.st = st; party.ver = st.ver;
     renderPartyBar();
+    if (prev && prev.host !== st.host && isHost(st)) toast('Du bist jetzt Gastgeber der Party');
     if (!$('player').classList.contains('open') && !party.joining) return;
-    if (st.by === party.cid && Date.now() - party.lastLocal < 4000) return;   // eigene Änderung – schon umgesetzt
+    if (isHost(st)) return;
     if (!playing || playing.id !== st.file) {
         if (!byId[st.file]) { toast('Dieser Titel ist auf deinem Gerät nicht verfügbar'); return; }
         markExpected('play');
         playId(st.file, true, { fromParty: true, at: partyExpected(st), paused: !st.playing });
         return;
     }
+    if (st.hb) return;   // nur eine Positionsmeldung des Gastgebers – das Tempo gleicht leise aus
     const exp = partyExpected(st), off = Math.abs(video.currentTime - exp);
     if (partyRuns(st) && st.at - serverNow() > 40) {
         // Gemeinsamer Start liegt noch in der Zukunft: still an die Startstelle gehen und punktgenau loslaufen
@@ -1664,94 +1702,67 @@ function partyApply(st) {
         if (off > 0.05 && video.paused) { markExpected('seek', exp); video.currentTime = exp; }
         if (video.paused) partySchedule();
     } else if (partyRuns(st)) {
-        // Nachricht kam erst nach dem Startpunkt an: sofort loslaufen, den Rest gleicht das Tempo unmerklich aus
-        if (off > 3) { markExpected('seek', exp); video.currentTime = exp; }   // nur wenn wirklich jemand gespult hat
-        if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
+        // Nachricht kam erst nach dem Startpunkt an: sofort loslaufen, den Rest gleicht das Tempo aus
+        if (off > 3) { markExpected('seek', exp); video.currentTime = exp; }   // nur wenn der Gastgeber wirklich gespult hat
+        if (video.paused && !party.localPaused) partyPlay();
     } else {
         clearTimeout(party.startTimer); party.startTimer = null;
-        const catching = st.held && st.playing && exp - video.currentTime > 0.15 && exp - video.currentTime < 60;   // holt noch auf
-        if (!catching) {
-            if (!video.paused) { markExpected('pause'); video.pause(); }
-            if (off > 0.15) { markExpected('seek', exp); video.currentTime = exp; }   // im Standbild angleichen – fällt nicht auf
-        }
+        if (!video.paused) { markExpected('pause'); video.pause(); }
+        if (off > 0.15) { markExpected('seek', exp); video.currentTime = exp; }   // im Standbild angleichen – fällt nicht auf
     }
-    if (st.held && (!prev || !prev.held)) {
-        const others = (st.waitingFor || []).filter(n => !party.holding || n !== partyName());
-        if (others.length && Date.now() - party.waitToast > 8000) { party.waitToast = Date.now(); toast(`⏳ Warte auf ${others.join(', ')} …`); }
-    }
-    if (prev && prev.playing !== st.playing && st.by !== party.cid) {
-        const who = (st.members.find(m => m.cid === st.by) || {}).name || 'Jemand';
-        toast(`${who} hat ${st.playing ? 'weitergespielt ▶' : 'pausiert ❚❚'}`);
-    }
+    if (prev && prev.playing !== st.playing) toast(`${hostName()} hat ${st.playing ? 'weitergespielt ▶' : 'pausiert ❚❚'}`);
 }
 
-// Nachziehen: jede Sekunde prüfen, kleine Abweichung sanft, große per Sprung ausgleichen
+// Zweimal pro Sekunde: Gäste leise nachführen
 function partyDrift() {
     const sync = $('party-sync');
     if (!party.code || !party.st || !playing || playing.id !== party.st.file || video.ended) {
         if (video.playbackRate !== 1) video.playbackRate = 1;
         return;
     }
-    const now = Date.now(), ahead = bufferedAhead();
-    // 0) Gemeinsamer Start steht noch bevor: nur sicherstellen, dass der Start geplant ist
-    if (partyRuns() && serverNow() < party.st.at) {
-        if (video.paused && !party.startTimer) partySchedule();
+    const now = Date.now(), exp = partyExpected(), diff = exp - video.currentTime, ad = Math.abs(diff);
+    // ---------- Gastgeber: wird nie angefasst. Hing er selbst kurz, meldet er seine echte Stelle. ----------
+    if (isHost()) {
         if (video.playbackRate !== 1) video.playbackRate = 1;
+        if (partyRuns() && !video.paused && !video.seeking && video.readyState >= 3 && serverNow() > party.st.at + 500
+            && ad > 0.25 && now - party.lastLocal > 2500 && now - party.lastHb > 4000) { party.lastHb = now; partySend({ hb: true }); }
+        if (sync) sync.textContent = partyRuns() ? 'du gibst den Takt vor' : 'pausiert';
         return;
     }
-    // 1) Dieses Gerät hängt länger fest -> alle warten lassen (kurze Hänger holt es später selbst leise auf)
+    // ---------- Gäste ----------
+    if (partyRuns() && serverNow() < party.st.at) {   // gemeinsamer Start steht bevor
+        if (video.paused && !party.startTimer) partySchedule();
+        return;
+    }
+    if (party.localPaused) { if (sync) sync.textContent = 'tippe ▶ zum Mitschauen'; return; }
     const stalled = video.readyState < 3 || (party.waitSince && now - party.waitSince > 300);
-    if (stalled && partyRuns()) { if (!party.stallSince) party.stallSince = now; } else party.stallSince = 0;
-    party.holdTimes = (party.holdTimes || []).filter(t => now - t < 180000);
-    const behind = partyExpected() - video.currentTime;
-    if (((party.stallSince && now - party.stallSince > 3000) || (partyRuns() && behind > 4 && behind < 60)) && !party.holding && !video.seeking && now - party.lastLocal > 1500) {
-        party.holding = true; party.holdTimes.push(now);
-        partyCall('hold', { code: party.code, on: true }).then(j => { if (j.ver > party.ver) partyApply(j); }).catch(() => {});
-    }
-    // Lieber einmal länger laden als oft kurz: nach jeder Wartepause wird mehr Vorrat verlangt
-    const need = [6, 12, 20][Math.min(2, Math.max(0, party.holdTimes.length - 1))];
-    const caught = !party.st.held || behind < 0.3;
-    if (party.holding && caught && (ahead >= need || video.duration - video.currentTime < need + 1 || (now - party.holdTimes[party.holdTimes.length - 1] > 40000 && ahead >= 3))) {
-        party.holding = false;
-        partyCall('hold', { code: party.code, on: false }).then(j => { if (j.ver > party.ver) partyApply(j); }).catch(() => {});
-    }
-    if (sync) sync.textContent = party.st.held ? `wartet auf ${(party.st.waitingFor || []).join(', ') || 'Gerät'} …` : '…';
-    // 2) Während geladen oder gesprungen wird: nichts anfassen (auch das Tempo nicht)
-    if (video.seeking || stalled) return;
-    if (now - party.lastLocal < 1500) return;
-    const exp = partyExpected(), diff = exp - video.currentTime, ad = Math.abs(diff);
+    if (video.seeking || stalled) { if (sync) sync.textContent = 'lädt …'; return; }   // beim Laden nichts anfassen
     if (partyRuns()) {
-        if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
+        if (video.paused) partyPlay();
         party.fixes = party.fixes.filter(t => now - t < 120000);
-        if (ad > 12 && now - party.lastFix > 8000 * Math.pow(2, party.fixes.length)) {
-            // Notfall (völlig auseinander): einmal springen
+        if (ad > 20 && now - party.lastFix > 10000 * Math.pow(2, party.fixes.length)) {
+            // Notfall: mehr als 20 s auseinander (Leitung viel zu langsam) – einmal zur gemeinsamen Stelle
             const target = exp + (diff > 0 ? party.seekLag : 0);
             party.lastFix = now; party.fixes.push(now); party.seekStart = now;
             markExpected('seek', target); video.currentTime = target; video.playbackRate = 1; party.glide = 0;
         } else {
-            // Ruhe vor Genauigkeit: Bis 0,35 s Abstand wird gar nichts verändert.
-            // Darüber läuft das Video mit EINEM festen Tempo (±5 %), bis es wieder passt – also nur zwei Tempowechsel.
+            // Bis 0,35 s Abstand wird nichts verändert. Darüber EIN festes Tempo (±5 %), bis es wieder passt.
             const dir = Math.sign(diff);
             if (!party.glide && ad > 0.35) party.glide = dir;
             if (party.glide && (ad < 0.05 || dir !== party.glide)) party.glide = 0;
             // Schneller laufen nur mit genug Vorrat – sonst würde das Aufholen selbst Hänger auslösen
-            if (party.glide > 0 && ahead < 5) party.glidePause = true;
-            if (party.glidePause && (ahead >= 9 || !party.glide || party.glide < 0)) party.glidePause = false;
+            if (party.glide > 0 && bufferedAhead() < 5) party.glidePause = true;
+            if (party.glidePause && (bufferedAhead() >= 9 || party.glide <= 0)) party.glidePause = false;
             const rate = !party.glide || party.glidePause ? 1 : party.glide > 0 ? (ad > 2 ? 1.08 : 1.05) : (ad > 2 ? 0.92 : 0.95);
-            if (video.playbackRate !== rate) { video.playbackRate = rate; party.rateChanges = (party.rateChanges || 0) + 1; }
+            if (video.playbackRate !== rate) video.playbackRate = rate;
         }
     } else {
         if (video.playbackRate !== 1) video.playbackRate = 1;
         party.glide = 0;
-        if (party.st.held && party.st.playing && diff > 0.15 && diff < 60) {
-            // Die Party wartet auf dieses Gerät: bis zur gemeinsamen Stelle weiterspielen, nichts überspringen
-            if (video.paused) { markExpected('play'); video.play().catch(() => {}); }
-        } else {
-            if (!video.paused) { markExpected('pause'); video.pause(); }
-            if (ad > 0.15) { markExpected('seek', exp); video.currentTime = exp; }
-        }
+        if (!video.paused) { markExpected('pause'); video.pause(); }
+        if (ad > 0.15) { markExpected('seek', exp); video.currentTime = exp; }
     }
-    if (sync && !party.st.held) sync.textContent = partyRuns() ? (ad < 0.35 ? 'synchron' : `holt leise auf (${diff > 0 ? '+' : ''}${diff.toFixed(1)} s)`) : 'pausiert';
+    if (sync) sync.textContent = partyRuns() ? (ad < 0.35 ? 'synchron' : `holt leise auf (${diff > 0 ? '+' : ''}${diff.toFixed(1)} s)`) : 'pausiert';
 }
 
 // Auf Änderungen warten (der Pi antwortet, sobald sich etwas tut)
@@ -1808,7 +1819,7 @@ async function partyCreateFor(id) {
 }
 function partyBegin() {
     video.preload = 'auto';
-    party.holding = false; party.fixes = []; party.lastFix = 0;
+    party.fixes = []; party.lastFix = 0; party.glide = 0; party.localPaused = false;
     clearInterval(party.driftTimer);
     party.driftTimer = setInterval(partyDrift, 500);
     partyLoop(); renderPartyBar();
@@ -1820,7 +1831,7 @@ function partyLeave(silent) {
     clearInterval(party.driftTimer);
     video.playbackRate = 1;
     partyCall('leave', { code }).catch(() => {});
-    party.holding = false; video.preload = 'metadata'; clearTimeout(party.startTimer); party.startTimer = null; party.glide = 0; party.glidePause = false; party.holdTimes = [];
+    video.preload = 'metadata'; clearTimeout(party.startTimer); party.startTimer = null; party.glide = 0; party.glidePause = false; party.localPaused = false; $('p-tap').classList.remove('show');
     renderPartyBar();
     if (!silent) toast('Party verlassen');
 }
@@ -1879,7 +1890,7 @@ function partyDialog(startFn) {
         <div class="pd-code">${esc(party.code)}</div>
         <p class="pd-small">Freunde öffnen SAYDELAY, tippen oben auf 👥 und geben den Code ein – oder du schickst ihnen den Link.</p>
         <div class="pd-members" id="pd-members"></div>
-        <div class="pd-sync">Status: <b id="party-sync">verbinde…</b></div>
+        <div class="pd-sync">Status: <b id="party-sync">verbinde…</b><br>${isHost() ? 'Du bist Gastgeber: Pause, Play und Spulen gelten für alle.' : `Gastgeber: <b>${esc(hostName())}</b> – nur er kann pausieren und spulen.`}</div>
         <div class="pd-actions">${startFn ? `<button class="btn" id="pd-start">${playIcon}Für alle starten</button>` : ''}<button class="btn ${startFn ? 'ghost' : ''}" id="pd-share">Link teilen</button><button class="btn ghost" id="pd-leave">Party verlassen</button></div>
         ${startFn ? '<p class="pd-small">Warte, bis alle beigetreten sind (Namen erscheinen oben), dann starte den Film für alle.</p>' : ''}`);
     renderPartyMembers();
