@@ -1798,20 +1798,20 @@ function partyDrift() {
         if (video.paused) partyPlay();
         if (party.resync && !video.paused) { partyResync(); return; }
         party.fixes = party.fixes.filter(t => now - t < 120000);
-        if (ad > 20 && now - party.lastFix > 10000 * Math.pow(2, party.fixes.length)) {
-            // Notfall: mehr als 20 s auseinander (Leitung viel zu langsam) – einmal zur gemeinsamen Stelle
+        if (ad > 10 && now - party.lastFix > 15000 * Math.pow(2, party.fixes.length)) {
+            // Mehr als 10 s auseinander: mit Tempo nicht mehr aufzuholen – einmal zur gemeinsamen Stelle springen
             const target = exp + (diff > 0 ? party.seekLag : 0);
             party.lastFix = now; party.fixes.push(now); party.seekStart = now;
             markExpected('seek', target); video.currentTime = target; video.playbackRate = 1; party.glide = 0;
         } else {
-            // Bis 0,5 s Abstand wird nichts verändert. Darüber EIN festes Tempo (±5 %), bis es wieder passt.
+            // Bis 0,5 s Abstand wird nichts verändert. Darüber gestaffeltes Tempo: großer Abstand schnell, zum Schluss sanft.
             const dir = Math.sign(diff);
             if (!party.glide && ad > (now - (party.tight || 0) < 20000 ? 0.12 : 0.5)) party.glide = dir;
             if (party.glide && (ad < 0.04 || dir !== party.glide)) party.glide = 0;
             // Schneller laufen nur mit genug Vorrat – sonst würde das Aufholen selbst Hänger auslösen
-            if (party.glide > 0 && bufferedAhead() < 6) party.glidePause = true;
-            if (party.glidePause && (bufferedAhead() >= 12 || party.glide <= 0)) party.glidePause = false;
-            const rate = !party.glide || party.glidePause ? 1 : party.glide > 0 ? (ad > 2 ? 1.08 : 1.05) : (ad > 2 ? 0.92 : 0.95);
+            if (party.glide > 0 && bufferedAhead() < 2.5) party.glidePause = true;
+            if (party.glidePause && (bufferedAhead() >= 5 || party.glide <= 0)) party.glidePause = false;
+            const rate = !party.glide || party.glidePause ? 1 : party.glide > 0 ? (ad > 2 ? 1.25 : ad > 0.8 ? 1.15 : ad > 0.3 ? 1.08 : 1.04) : (ad > 2 ? 0.8 : ad > 0.8 ? 0.88 : ad > 0.3 ? 0.94 : 0.97);
             if (video.playbackRate !== rate) video.playbackRate = rate;
         }
         partyInfo(null, ad < 0.5 ? 'ok' : ad < 3 ? 'warn' : 'bad', diff);
@@ -1831,11 +1831,12 @@ function partyBitrate() {
 // Anzeige für Gäste: Verzögerung zum Gastgeber oben im Player + Details im Party-Fenster
 function partyInfo(text, level, diff) {
     const fmt = d => Math.abs(d).toFixed(1).replace('.', ',') + (d >= 0 ? ' s hinten' : ' s vorn');
-    const label = text || (Math.abs(diff) < 0.15 ? 'synchron' : fmt(diff));
+    const moving = party.glide && !party.glidePause && video.playbackRate !== 1;
+    const label = text || (Math.abs(diff) < 0.15 ? 'synchron' : fmt(diff) + (moving ? ' · holt auf' : ''));
     const el = $('party-delay');
     if (el) { el.textContent = label; el.className = 'pp-delay ' + level; }
     const sync = $('party-sync');
-    if (sync) sync.textContent = text ? `${text}${Math.abs(diff) >= 0.15 ? ' · ' + fmt(diff) : ''}` : (Math.abs(diff) < 0.15 ? 'synchron' : `${fmt(diff)}${party.glide ? ' · gleicht leise aus' : ''}`);
+    if (sync) sync.textContent = text ? `${text}${Math.abs(diff) >= 0.15 ? ' · ' + fmt(diff) : ''}` : (Math.abs(diff) < 0.15 ? 'synchron' : `${fmt(diff)}${moving ? ` · holt auf (Tempo ${Math.round(video.playbackRate * 100)} %)` : party.glide > 0 ? ' · zu wenig vorgeladen zum Aufholen' : ''}`);
     const dg = $('pd-diag');
     if (dg) {
         const mb = partyBitrate();
